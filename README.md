@@ -4,6 +4,12 @@
 
 输入视频链接或本地音视频即可转写。脚本默认从音轨开始，用 faster-whisper 在本机识别文字和时间，再用独立模型恢复中文标点。
 
+## Codex Skill
+
+从人物、主题或链接出发，查找原视频、核对来源、提取已有字幕，缺字幕时调用本项目转写音轨。Skill 会交付带时间戳的 TXT 和 SRT，并说明字幕来自哪里、时间戳是否为估算。[video-transcript-research](skills/video-transcript-research/SKILL.md)
+
+示例请求：“找一场黄仁勋谈 AI 基础设施的完整访谈，给我原视频链接和带时间戳的文字稿。”
+
 ## 支持的来源
 
 | 来源 | 处理方式 |
