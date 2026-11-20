@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Generated transcripts and temporary files
+transcripts/
+.transcribe-*/
+.transcript-*/
+
+# Local settings and credentials
+.env
+.env.*
+cookies.txt
