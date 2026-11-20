@@ -11,10 +11,13 @@ import os
 import re
 import shutil
 import sys
+from tarfile import TarError
 from tempfile import TemporaryDirectory
+from textwrap import fill
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from urllib.request import Request, urlopen
 
+from restore_punctuation import MARKS, SENTENCE_END, get_model, join_text, load_predictor, restore_lines
 
 BILIBILI_API = "https://api.bilibili.com"
 BILIBILI_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36"
@@ -144,7 +147,7 @@ def resolve_bilibili(identifier: str, part: int, directory: Path, args):
         title = f"{title} P{part} {page['part']}"
         source = f"{source}?p={part}"
     parameters = {"bvid": details["bvid"], "cid": page["cid"]}
-    if not args.force_asr:
+    if args.prefer_subtitles:
         try:
             subtitles = bilibili_subtitles(parameters, headers, args.language)
         except (ValueError, OSError) as exc:
@@ -201,15 +204,15 @@ def resolve_video(url: str, directory: Path, args):
         "js_runtimes": {args.js_runtime: {}},
     }
     status(f"正在读取 {parsed.hostname} 的视频信息。")
-    metadata_options = {**options, "writesubtitles": not args.force_asr,
-                        "writeautomaticsub": not args.force_asr}
+    metadata_options = {**options, "writesubtitles": args.prefer_subtitles,
+                        "writeautomaticsub": args.prefer_subtitles}
     with yt_dlp.YoutubeDL(metadata_options) as downloader:
         info = downloader.extract_info(url, download=False)
         if not info or "entries" in info:
             raise ValueError("请提供单个视频的链接。多分 P 视频可在链接中指定 ?p=页码。")
         title = info.get("title") or info["id"]
         source = info.get("webpage_url") or url
-        if not args.force_asr:
+        if args.prefer_subtitles:
             result = read_platform_subtitles(downloader, info, args.language)
             if result:
                 cues, language, method = result
@@ -223,6 +226,23 @@ def resolve_video(url: str, directory: Path, args):
         raise ValueError("音轨下载结束后未找到媒体文件。")
     cues, language = recognize(media, args)
     return title, source, cues, language, f"本地语音识别（{Path(args.model).name}）"
+
+
+def punctuate_cues(cues: list[Cue], predict) -> list[Cue]:
+    restored = []
+    start = 0
+    size = 0
+    for index, cue in enumerate(cues):
+        size += len(cue.text)
+        is_last = index == len(cues) - 1
+        pause = is_last or cues[index + 1].start - cue.end >= 0.9
+        if not (pause or size >= 200):
+            continue
+        batch = cues[start:index + 1]
+        lines = restore_lines([item.text for item in batch], predict, ends_at_pause=pause)
+        restored.extend(Cue(item.start, item.end, text) for item, text in zip(batch, lines))
+        start, size = index + 1, 0
+    return restored
 
 
 def recognize(media: Path, args) -> tuple[list[Cue], str]:
@@ -252,6 +272,19 @@ def recognize(media: Path, args) -> tuple[list[Cue], str]:
     if info.language == "zh":
         convert = OpenCC("t2s").convert
         captions = [Cue(cue.start, cue.end, convert(cue.text)) for cue in captions]
+        if captions and args.punctuation != "off":
+            from huggingface_hub.constants import HF_HOME
+
+            try:
+                status("正在从识别文本恢复中文标点。首次运行可能下载标点模型。")
+                cache = Path(args.cache_dir or HF_HOME).expanduser() / "video2txt"
+                model_path = args.punctuation_model or get_model(cache)
+                restored = punctuate_cues(captions, load_predictor(model_path, args.threads))
+                changed = sum(before.text != after.text for before, after in zip(captions, restored))
+                status(f"已为 {changed} 个时间段补充标点。")
+                captions = restored
+            except (EOFError, ImportError, OSError, RuntimeError, TarError, ValueError) as exc:
+                status(f"标点恢复失败，输出原识别文字及其时间段。{exc}")
     return captions, info.language
 
 
@@ -265,22 +298,25 @@ def timestamp(seconds: float, *, milliseconds: bool) -> str:
 
 
 def transcript_paragraphs(cues: list[Cue]) -> list[str]:
+    marked = sum(any(mark in MARKS for mark in cue.text) for cue in cues)
+    short_lines = marked * 20 < len(cues)
     paragraphs = []
-    start = cues[0].start
+    start = end = 0.0
     paragraph = ""
-    for index, cue in enumerate(cues):
-        if paragraph and re.search(r"[A-Za-z0-9,;:.!?]$", paragraph) and re.match(r"[A-Za-z0-9]", cue.text):
-            paragraph += " "
-        paragraph += cue.text
-        duration = cue.end - start
-        if index == len(cues) - 1:
-            paragraphs.append(f"[{timestamp(start, milliseconds=False)}] {paragraph}")
-        else:
-            following = cues[index + 1]
-            if duration >= 40 or (duration >= 18 and paragraph.endswith(("。", "？", "！", ".", "?", "!"))) or following.start - cue.end >= 2:
-                paragraphs.append(f"[{timestamp(start, milliseconds=False)}] {paragraph}")
-                start, paragraph = following.start, ""
-    return paragraphs
+    for cue in cues:
+        combined = join_text(paragraph, cue.text)
+        if paragraph and (short_lines or len(combined) > 100 or cue.end - start > 15
+                          or cue.start - end >= 1.5 or paragraph.endswith(SENTENCE_END)):
+            paragraphs.append((start, paragraph))
+            combined = cue.text
+            paragraph = ""
+        if not paragraph:
+            start = cue.start
+        paragraph, end = combined, cue.end
+    if paragraph:
+        paragraphs.append((start, paragraph))
+    return [f"[{timestamp(start, milliseconds=False)}] {fill(text, width=72, break_on_hyphens=False)}"
+            for start, text in paragraphs]
 
 
 def write_outputs(cues: list[Cue], title: str, source: str, language: str, method: str,
@@ -321,7 +357,13 @@ def main() -> int:
     parser.add_argument("--cache-dir", help="faster-whisper 模型缓存目录")
     parser.add_argument("--js-runtime", choices=("deno", "node"), default="deno",
                         help="yt-dlp 用于 YouTube 等网站的 JavaScript 运行时")
-    parser.add_argument("--force-asr", action="store_true", help="跳过平台字幕，直接转写音轨")
+    parser.add_argument("--punctuation", choices=("auto", "off"), default="auto",
+                        help="中文转写后恢复标点，或保留识别模型给出的标点")
+    parser.add_argument("--punctuation-model", type=Path, help="使用本地的 sherpa-onnx 标点模型文件")
+    subtitle_mode = parser.add_mutually_exclusive_group()
+    subtitle_mode.add_argument("--prefer-subtitles", action="store_true", help="有平台字幕时优先导入")
+    subtitle_mode.add_argument("--force-asr", dest="prefer_subtitles", action="store_false", help=argparse.SUPPRESS)
+    parser.set_defaults(prefer_subtitles=False)
     args = parser.parse_args()
     if args.threads < 1:
         parser.error("--threads 必须大于零")
